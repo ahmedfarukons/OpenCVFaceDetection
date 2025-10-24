@@ -2,7 +2,7 @@
 using System.Drawing;
 using System.IO;
 using System.Linq;
-using System.Reflection;
+using System.Net;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 using OpenCvSharp;
@@ -21,13 +21,15 @@ namespace OpenCVApp
 
         private CascadeClassifier faceCascade;
         private string cascadePath;
+        private const string DefaultCascadeFileName = "haarcascade_frontalface_default.xml";
+        private const string DefaultCascadeUrl = "https://raw.githubusercontent.com/opencv/opencv/master/data/haarcascades/haarcascade_frontalface_default.xml";
 
         public Form1()
         {
             InitializeComponent();
 
             // Try to auto-load cascade from app directory
-            var candidate = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "haarcascade_frontalface_default.xml");
+            var candidate = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, DefaultCascadeFileName);
             if (File.Exists(candidate))
             {
                 TryLoadCascade(candidate);
@@ -67,10 +69,17 @@ namespace OpenCVApp
         {
             using (var ofd = new OpenFileDialog())
             {
-                ofd.Filter = "XML files|*.xml|All files|*.*";
+                ofd.Filter = "Cascade XML (*.xml)|*.xml";
                 ofd.Title = "Select Haar Cascade XML file (e.g. haarcascade_frontalface_default.xml)";
+                ofd.CheckFileExists = true;
                 if (ofd.ShowDialog() == DialogResult.OK)
                 {
+                    var ext = Path.GetExtension(ofd.FileName);
+                    if (!string.Equals(ext, ".xml", StringComparison.OrdinalIgnoreCase))
+                    {
+                        SetInfoText("Please select a .xml cascade file, not an image.");
+                        return;
+                    }
                     TryLoadCascade(ofd.FileName);
                 }
             }
@@ -80,6 +89,18 @@ namespace OpenCVApp
         {
             try
             {
+                if (!File.Exists(path))
+                {
+                    SetInfoText("Failed to load cascade: file not found");
+                    return;
+                }
+
+                if (!IsLikelyValidCascade(path))
+                {
+                    SetInfoText("Failed to load cascade: file does not look like a valid OpenCV cascade XML. If downloaded from the web, ensure you saved the RAW XML, not the HTML page.");
+                    return;
+                }
+
                 var cc = new CascadeClassifier(path);
                 // small test: ensure it's loaded
                 if (!cc.Empty())
@@ -99,52 +120,68 @@ namespace OpenCVApp
             }
         }
 
-        private Bitmap MatToBitmap(Mat mat)
+        private bool IsLikelyValidCascade(string path)
         {
-            if (mat == null) return null;
-
-            // Try to find OpenCvSharp.Extensions.BitmapConverter via reflection
             try
             {
-                Type converterType = Type.GetType("OpenCvSharp.Extensions.BitmapConverter, OpenCvSharp.Extensions");
-                if (converterType == null)
+                var fi = new FileInfo(path);
+                if (fi.Length < 1024) return false; // too small
+                using (var fs = File.OpenRead(path))
                 {
-                    // search loaded assemblies
-                    foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
-                    {
-                        try
-                        {
-                            converterType = asm.GetType("OpenCvSharp.Extensions.BitmapConverter");
-                            if (converterType != null) break;
-                        }
-                        catch
-                        {
-                            // ignore
-                        }
-                    }
-                }
-
-                if (converterType != null)
-                {
-                    var mi = converterType.GetMethod("ToBitmap", BindingFlags.Public | BindingFlags.Static, null, new Type[] { typeof(Mat) }, null);
-                    if (mi != null)
-                    {
-                        var bmp = mi.Invoke(null, new object[] { mat }) as Bitmap;
-                        if (bmp != null) return bmp;
-                    }
+                    byte[] buf = new byte[Math.Min(8192, (int)fi.Length)];
+                    int read = fs.Read(buf, 0, buf.Length);
+                    string head = System.Text.Encoding.UTF8.GetString(buf, 0, read);
+                    head = head.ToLowerInvariant();
+                    if (head.Contains("<!doctype html") || head.Contains("<html")) return false; // downloaded webpage
+                    bool hasOpencvTags = head.Contains("<opencv_storage>") || head.Contains("opencv_storage") || head.Contains("stages") || head.Contains("cascade");
+                    bool hasXmlDecl = head.Contains("<?xml");
+                    return hasXmlDecl && hasOpencvTags;
                 }
             }
             catch
             {
-                // ignore and fallback
+                return false;
             }
+        }
 
-            // Fallback: encode to BMP and create Bitmap
+        private void EnsureDefaultCascadeExists(string targetPath)
+        {
+            try
+            {
+                if (File.Exists(targetPath) && IsLikelyValidCascade(targetPath)) return;
+
+                // Create directory if needed
+                var dir = Path.GetDirectoryName(targetPath);
+                if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+
+                using (var wc = new WebClient())
+                {
+                    wc.DownloadFile(DefaultCascadeUrl, targetPath);
+                }
+
+                if (!IsLikelyValidCascade(targetPath))
+                {
+                    try { File.Delete(targetPath); } catch { }
+                }
+            }
+            catch
+            {
+                // ignore, will fallback to manual selection
+            }
+        }
+
+        private Bitmap MatToBitmap(Mat mat)
+        {
+            if (mat == null) return null;
+            // Encode to BMP and create a detached Bitmap copy
+            // Important: Bitmap(ms) keeps a reference to the stream; to safely Save later,
+            // we must return a deep copy that is NOT tied to the stream to avoid GDI+ errors.
             byte[] imgData;
             Cv2.ImEncode(".bmp", mat, out imgData);
             using (var ms = new MemoryStream(imgData))
+            using (var temp = new Bitmap(ms))
             {
-                return new Bitmap(ms);
+                return new Bitmap(temp);
             }
         }
 
@@ -169,7 +206,9 @@ namespace OpenCVApp
             {
                 try
                 {
-                    var defaultXml = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "haarcascade_frontalface_default.xml");
+                    var defaultXml = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, DefaultCascadeFileName);
+                    // Try to ensure default cascade exists by downloading if missing
+                    EnsureDefaultCascadeExists(defaultXml);
                     if (File.Exists(defaultXml))
                     {
                         TryLoadCascade(defaultXml);
@@ -178,11 +217,20 @@ namespace OpenCVApp
                     {
                         using (var ofd = new OpenFileDialog())
                         {
-                            ofd.Filter = "XML files|*.xml|All files|*.*";
+                            ofd.Filter = "Cascade XML (*.xml)|*.xml";
                             ofd.Title = "Select Haar Cascade (optional)";
+                            ofd.CheckFileExists = true;
                             if (ofd.ShowDialog() == DialogResult.OK)
                             {
-                                TryLoadCascade(ofd.FileName);
+                                var ext = Path.GetExtension(ofd.FileName);
+                                if (!string.Equals(ext, ".xml", StringComparison.OrdinalIgnoreCase))
+                                {
+                                    SetInfoText("Please select a .xml cascade file, not an image.");
+                                }
+                                else
+                                {
+                                    TryLoadCascade(ofd.FileName);
+                                }
                             }
                             else
                             {
